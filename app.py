@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 import nr_modelo as nm
 
 modelo = joblib.load("modelo_rf_nr.joblib")
+dem = nm.DEM("dem_jf.npz") if modelo.get("usa_dem") else None  # relevo de Juiz de Fora
 if modelo.get("sklearn_versao") != sklearn.__version__:
     print(f"AVISO: modelo treinado com scikit-learn {modelo.get('sklearn_versao')}, "
           f"servidor usa {sklearn.__version__}. Fixe a mesma versão no requirements.txt.")
@@ -39,6 +40,7 @@ class Pedido(BaseModel):
 @app.get("/")
 def status():
     return {"status": "ok", "modelo": modelo.get("baseline", "38901") + " + Random Forest",
+            "usa_relevo": bool(modelo.get("usa_dem")),
             "treinado_em": modelo.get("treinado_em"), "n_locais_treino": modelo.get("n_locais")}
 
 
@@ -48,8 +50,8 @@ def prever(p: Pedido):
         raise HTTPException(422, "O modelo só cobre a banda n78.")
     try:
         r = nm.simular(modelo, p.latitude, p.longitude, p.azimute, p.altura_antena_m,
-                       p.modo, p.raio_m, p.passo_m)
-    except ValueError as e:  # fora de Juiz de Fora
+                       p.modo, p.raio_m, p.passo_m, dem=dem)
+    except ValueError as e:  # fora de Juiz de Fora ou do mapa de relevo
         raise HTTPException(422, str(e))
     if not p.incluir_heatmap:
         for s in r["setores"]:
