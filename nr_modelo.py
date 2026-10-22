@@ -5,7 +5,11 @@ As features são calculadas pela mesma função nos dois lugares, para o modelo
 não ver no ar algo diferente do que viu no treino.
 
 Modelo v2 (com relevo): RSRP = baseline físico + RF(features)
-  - baseline "fisica_relevo": a0 + a1*log10(d3D) + a2*L_difracao, calibrado nos dados
+  - baseline "fisica_relevo": a0 + a1*log10(d3D) + a2*L_difracao + a3*G_antena, calibrado nos dados
+  - G_antena: padrão horizontal de antena setorial 3GPP (65°), dá o formato do setor
+  - baseline "fisica_38901": P0 - PL_38901_UMa(d, h) + a2*L_difracao + a3*G_antena + G_vertical,
+    com a inclinação da distância e o padrão vertical (downtilt) FIXOS pela física (3GPP);
+    só o nível P0 e os pesos de difração e do padrão horizontal são calibrados
   - L_difracao: perda por difração no obstáculo dominante do perfil de terreno
     (gume de faca, ITU-R P.526), calculada com o DEM Copernicus GLO-30
   - RF: Random Forest no resíduo (medido - baseline)
@@ -84,6 +88,46 @@ def rumo(lat1, lon1, lat2, lon2):
     return (np.degrees(np.arctan2(x, y)) + 360) % 360
 
 
+def prob_los_uma(d2d):
+    """Probabilidade de LOS, 3GPP TR 38.901 Tabela 7.4.2-1 (UMa, h_UT <= 13 m)."""
+    d = np.maximum(d2d, 1e-6)
+    return np.where(d2d <= 18, 1.0, 18 / d + np.exp(-d / 63) * (1 - 18 / d))
+
+
+def pl_38901_uma(d2d, h_bs, h_ut=H_UT, fc_ghz=FC_GHZ):
+    """Perda de percurso esperada (dB), 38.901 Tabela 7.4.1-1, UMa: LOS e NLOS
+    ponderados pela probabilidade de LOS. Inclinação física: ~22 dB/década perto
+    da torre (LOS), ~39 dB/década em NLOS."""
+    d2d = np.clip(d2d, 10, 5000)
+    h_bs = np.clip(h_bs, 10, 150)
+    d3d = np.sqrt(d2d ** 2 + (h_bs - h_ut) ** 2)
+    lf = 20 * np.log10(fc_ghz)
+    d_bp = 4 * (h_bs - 1.0) * (h_ut - 1.0) * fc_ghz * 1e9 / C_LUZ
+    pl1 = 28.0 + 22 * np.log10(d3d) + lf
+    pl2 = 28.0 + 40 * np.log10(d3d) + lf - 9 * np.log10(d_bp ** 2 + (h_bs - h_ut) ** 2)
+    pl_los = np.where(d2d <= d_bp, pl1, pl2)
+    pl_nlos = np.maximum(pl_los, 13.54 + 39.08 * np.log10(d3d) + lf - 0.6 * (h_ut - 1.5))
+    p = prob_los_uma(d2d)
+    return p * pl_los + (1 - p) * pl_nlos
+
+
+def ganho_padrao_h(ang_graus, abertura=65.0, a_max=30.0):
+    """Padrão horizontal de antena setorial (3GPP TR 38.901, Tabela 7.3-1), em dB relativo ao eixo."""
+    return -np.minimum(12 * (np.asarray(ang_graus) / abertura) ** 2, a_max)
+
+
+# padrão vertical de antena de macrocélula (3GPP TR 36.873): feixe estreito com downtilt.
+# Logo embaixo da torre o receptor fica fora do feixe vertical e o sinal cai.
+TILT_GRAUS = 6.0
+ABERTURA_V_GRAUS = 10.0
+SLA_V_DB = 20.0
+
+
+def ganho_padrao_v(elev_graus, tilt=TILT_GRAUS, abertura=ABERTURA_V_GRAUS, sla=SLA_V_DB):
+    """Atenuação vertical (dB, <= 0) para um receptor elev_graus abaixo do horizonte da antena."""
+    return -np.minimum(12 * ((np.asarray(elev_graus) - tilt) / abertura) ** 2, sla)
+
+
 def perda_gume_faca(nu):
     """ITU-R P.526: perda (dB) de um obstáculo em gume de faca."""
     nu = np.asarray(nu, dtype=float)
@@ -126,7 +170,8 @@ def calcular_features(lat_t, lon_t, azimute, h_ant, lat_p, lon_p, dem=None):
 
     d2d = distancia_2d(lat_t, lon_t, lat_p, lon_p)
     ang = np.abs(((rumo(lat_t, lon_t, lat_p, lon_p) - np.asarray(azimute) + 180) % 360) - 180)
-    f = {"d2d": d2d, "log10_d2d": np.log10(np.clip(d2d, 10, None)), "ang_off_az": ang}
+    f = {"d2d": d2d, "log10_d2d": np.log10(np.clip(d2d, 10, None)), "ang_off_az": ang,
+         "ganho_antena_db": ganho_padrao_h(ang)}
 
     if dem is None:
         h_rel = h_ant - H_UT
@@ -140,6 +185,8 @@ def calcular_features(lat_t, lon_t, azimute, h_ant, lat_p, lon_p, dem=None):
 
     f["h_rel_m"] = np.asarray(h_rel, dtype=float)
     f["elev_graus"] = np.degrees(np.arctan2(h_rel, np.maximum(d2d, 1.0)))
+    f["pl_38901"] = pl_38901_uma(d2d, f["h_rel_m"] + H_UT)
+    f["ganho_vertical_db"] = ganho_padrao_v(f["elev_graus"])
     f["d3d"] = np.sqrt(np.maximum(d2d, 1.0) ** 2 + h_rel ** 2)
     return f
 
@@ -151,8 +198,13 @@ def montar_X(feats, nomes):
 def baseline_rsrp(modelo, f):
     b = modelo.get("baseline", "38901")
     if b == "fisica_relevo":
-        a0, a1, a2 = modelo["coef_fisica"]
-        return a0 + a1 * np.log10(f["d3d"]) + a2 * f["difracao_db"]
+        c = modelo["coef_fisica"]
+        r = c[0] + c[1] * np.log10(f["d3d"]) + c[2] * f["difracao_db"]
+        return r + c[3] * f["ganho_antena_db"] if len(c) > 3 else r
+    if b == "fisica_38901":
+        c = modelo["coef_fisica"]
+        return (c[0] - f["pl_38901"] + c[1] * f["difracao_db"] + c[2] * f["ganho_antena_db"]
+                + f["ganho_vertical_db"])
     if b == "logdist":
         return modelo["ld_a0"] + modelo["ld_a1"] * np.log10(f["d3d"])
     raise ValueError(f"baseline desconhecido: {b}")
