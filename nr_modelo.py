@@ -262,3 +262,128 @@ def simular(modelo, latitude, longitude, azimute, altura_antena_m=30.0,
             "area_mediana_percentual": round(100 * float(np.mean((melhor <= LIMIAR_BOA) & (melhor >= LIMIAR_MEDIANA))), 1),
         }
     return resposta
+
+
+# ======================= modo cidade (até 10 torres) =======================
+# Ruído térmico por elemento de recurso (SCS 30 kHz) com figura de ruído de 7 dB: ~ -122 dBm.
+RUIDO_RE_DBM = -174.0 + 10 * np.log10(30e3) + 7.0
+LIMIAR_RELEVANTE_DBM = -110.0   # um setor só "chega" a um ponto acima disso
+SINR_BAIXA_DB = 13.0            # acima: interferência baixa
+SINR_ALTA_DB = 0.0              # abaixo: interferência alta
+MAX_PONTOS_CIDADE = 15000   # mantém a resposta leve e rápida no servidor gratuito
+FAIXAS_RSRP = [("excelente", -80.0, np.inf), ("bom", -90.0, -80.0), ("regular", -100.0, -90.0),
+               ("fraco", -110.0, -100.0), ("sem_cobertura", -np.inf, -110.0)]
+
+
+def simular_cidade(modelo, torres, raio_m=2000, passo_m=None, dem=None, incluir_pontos=True):
+    """Várias torres na MESMA grade: RSRP da melhor torre e SINR em cada ponto.
+    torres: lista de dicts com latitude, longitude, azimute, altura_antena_m, modo.
+    Premissa: todas as torres são da mesma operadora e usam a mesma frequência (interferência co-canal)."""
+    if not 1 <= len(torres) <= 10:
+        raise ValueError("O modo cidade aceita de 1 a 10 torres.")
+    for i, t in enumerate(torres, 1):
+        if float(distancia_2d(CENTRO_JF[0], CENTRO_JF[1], t["latitude"], t["longitude"])) > RAIO_MAX_JF_M:
+            raise ValueError(f"A torre {i} está fora da região de Juiz de Fora, onde o modelo foi treinado.")
+
+    # grade comum em metros, ao redor de todas as torres
+    lat_c = float(np.mean([t["latitude"] for t in torres]))
+    lon_c = float(np.mean([t["longitude"] for t in torres]))
+    k_lon = R_TERRA * np.cos(np.radians(lat_c))
+    tx = np.array([np.radians(t["longitude"] - lon_c) * k_lon for t in torres])
+    ty = np.array([np.radians(t["latitude"] - lat_c) * R_TERRA for t in torres])
+    x0, x1, y0, y1 = tx.min() - raio_m, tx.max() + raio_m, ty.min() - raio_m, ty.max() + raio_m
+    area_util = len(torres) * np.pi * raio_m ** 2
+    passo = max(passo_m or 0, 25, int(np.ceil(np.sqrt(min((x1 - x0) * (y1 - y0), area_util) / MAX_PONTOS_CIDADE) / 5) * 5))
+    gx, gy = np.meshgrid(np.arange(x0, x1 + passo, passo), np.arange(y0, y1 + passo, passo))
+    gx, gy = gx.ravel(), gy.ravel()
+    dist = np.sqrt((gx[None, :] - tx[:, None]) ** 2 + (gy[None, :] - ty[:, None]) ** 2)   # torres x pontos
+    manter = (dist <= raio_m).any(axis=0)
+    gx, gy, dist = gx[manter], gy[manter], dist[:, manter]
+    lat_p = lat_c + np.degrees(gy / R_TERRA)
+    lon_p = lon_c + np.degrees(gx / k_lon)
+    if modelo.get("usa_dem") and not np.all(dem.cobre(lat_p, lon_p)):
+        raise ValueError("A área analisada sai do mapa de relevo carregado (Juiz de Fora e arredores).")
+
+    # RSRP de cada setor de cada torre (o perfil de terreno é calculado uma vez por torre)
+    dem_uso = dem if modelo.get("usa_dem") else None
+    rsrp_setores, torre_do_setor = [], []
+    for i, t in enumerate(torres):
+        azs = ([t["azimute"] % 360] if t.get("modo", "torre_completa") == "setor_unico"
+               else [(t["azimute"] + k) % 360 for k in (0, 120, 240)])
+        idx = np.where(dist[i] <= raio_m)[0]
+        f = calcular_features(t["latitude"], t["longitude"], azs[0], t.get("altura_antena_m", 30.0),
+                              lat_p[idx], lon_p[idx], dem=dem_uso)
+        brg = rumo(t["latitude"], t["longitude"], lat_p[idx], lon_p[idx])
+        for az in azs:
+            g = dict(f)
+            g["ang_off_az"] = np.abs(((brg - az + 180) % 360) - 180)
+            g["ganho_antena_db"] = ganho_padrao_h(g["ang_off_az"])
+            r = np.full(len(lat_p), -np.inf)
+            r[idx] = baseline_rsrp(modelo, g) + modelo["rf"].predict(montar_X(g, modelo["features"]))
+            rsrp_setores.append(r)
+            torre_do_setor.append(i)
+    S = np.vstack(rsrp_setores)                     # setores x pontos
+    torre_do_setor = np.array(torre_do_setor)
+
+    ordem = np.argsort(-S, axis=0)
+    melhor_idx, segundo_idx = ordem[0], (ordem[1] if len(S) > 1 else ordem[0])
+    melhor = S[melhor_idx, np.arange(S.shape[1])]
+    torre_serv = torre_do_setor[melhor_idx]
+    # interferência = setores das OUTRAS torres (a ideia do modo cidade é a interseção entre torres);
+    # os setores da própria torre servidora não entram (o padrão efetivo calibrado subestima a separação entre eles)
+    lin = np.where(np.isfinite(S), 10 ** (S / 10), 0.0)
+    da_servidora = torre_do_setor[:, None] == torre_serv[None, :]
+    interf = np.where(da_servidora, 0.0, lin).sum(axis=0)
+    sinr = melhor - 10 * np.log10(interf + 10 ** (RUIDO_RE_DBM / 10))
+    # quantas TORRES chegam ao ponto acima do limiar
+    T = np.vstack([S[torre_do_setor == i].max(axis=0) for i in range(len(torres))])
+    n_chegam = (T >= LIMIAR_RELEVANTE_DBM).sum(axis=0)
+    sobrepoe = n_chegam >= 2
+    # segunda torre mais forte (para identificar o par que disputa o ponto)
+    T_sem = np.where(np.arange(len(torres))[:, None] == torre_serv[None, :], -np.inf, T)
+    torre_seg = np.argmax(T_sem, axis=0) if len(torres) > 1 else torre_serv
+    classe = np.where(~sobrepoe, "nenhuma", np.where(sinr > SINR_BAIXA_DB, "baixa",
+                      np.where(sinr >= SINR_ALTA_DB, "media", "alta")))
+    intensidade = np.where(sobrepoe, np.clip((SINR_BAIXA_DB - sinr) / (SINR_BAIXA_DB + 10.0), 0, 1), 0.0)
+
+    # resumo para o painel e para o Diagnóstico IA
+    n = len(melhor)
+    pct = lambda m: round(100 * float(np.mean(m)), 1)
+    faixas = {nome: pct((melhor >= lo) & (melhor < hi)) for nome, lo, hi in FAIXAS_RSRP}
+    interf_pct = {c: pct(classe == c) for c in ("nenhuma", "baixa", "media", "alta")}
+    pares = {}
+    for k in np.where(np.isin(classe, ["media", "alta"]))[0]:
+        par = tuple(sorted((int(torre_serv[k]) + 1, int(torre_seg[k]) + 1)))
+        pares.setdefault(par, []).append(k)
+    lista_pares = []
+    for par, ks in pares.items():
+        ks = np.array(ks)
+        alta = ks[classe[ks] == "alta"]
+        foco = alta if len(alta) else ks
+        lista_pares.append({
+            "torres": list(par),
+            "area_com_interferencia_pct": pct(np.isin(np.arange(n), ks)),
+            "area_interferencia_alta_pct": round(100 * len(alta) / n, 1),
+            "sinr_medio_db": round(float(np.mean(sinr[ks])), 1),
+            "ponto_critico": {"lat": round(float(lat_p[foco].mean()), 6), "lng": round(float(lon_p[foco].mean()), 6)},
+        })
+    lista_pares.sort(key=lambda p: (p["area_interferencia_alta_pct"], p["area_com_interferencia_pct"]), reverse=True)
+    por_torre = [{"torre": i + 1, "area_servida_pct": pct(torre_serv == i),
+                  "rsrp_pico_dbm": round(float(S[torre_do_setor == i].max()), 1)} for i in range(len(torres))]
+    resumo = {
+        "n_torres": len(torres), "raio_m": raio_m, "passo_m": passo, "n_pontos": n,
+        "premissa": "Torres da mesma operadora na mesma frequência (interferência co-canal).",
+        "faixas_rsrp_pct": faixas,
+        "interferencia_pct": interf_pct,
+        "sinr_mediano_sobreposicao_db": round(float(np.median(sinr[sobrepoe])), 1) if sobrepoe.any() else None,
+        "pares_criticos": lista_pares[:3],
+        "por_torre": por_torre,
+    }
+    resposta = {"torres": [{"torre": i + 1, **t} for i, t in enumerate(torres)], "resumo": resumo}
+    if incluir_pontos:
+        resposta["pontos"] = [
+            {"lat": round(float(a), 6), "lng": round(float(b), 6), "rsrp_dbm": round(float(r), 1),
+             "sinr_db": round(float(s), 1), "interferencia": str(c), "intensidade": round(float(it), 2),
+             "torre": int(ts) + 1}
+            for a, b, r, s, c, it, ts in zip(lat_p, lon_p, melhor, sinr, classe, intensidade, torre_serv)]
+    return resposta
